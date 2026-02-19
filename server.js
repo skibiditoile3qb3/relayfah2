@@ -1,19 +1,40 @@
 const WebSocket = require('ws');
+const http = require('http');
 const { MongoClient, ObjectId } = require('mongodb');
 
-const MONGO_URI = 'mongodb+srv://skibiditoile3qb_db_user:VVnERbwKXqwivQEo@cluster0.fydfhut.mongodb.net/?appName=Cluster0';
+const MONGO_URI = process.env.MONGO_URI;
 const PORT = process.env.PORT || 8080;
 
-let db;
-let wss;
+if (!MONGO_URI) {
+  console.error('FATAL: MONGO_URI environment variable is not set.');
+  process.exit(1);
+}
 
+let db;
+
+// ─── HTTP SERVER (Render free tier requires an HTTP port to stay alive) ───────
+const httpServer = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Forum WebSocket Server OK\n');
+});
+
+// ─── WEBSOCKET SERVER (attached to HTTP server) ───────────────────────────────
+const wss = new WebSocket.Server({ server: httpServer });
+
+// ─── MONGODB ──────────────────────────────────────────────────────────────────
 async function connectDB() {
   const client = new MongoClient(MONGO_URI);
   await client.connect();
   db = client.db('forum_db');
-  console.log('Connected to MongoDB');
+  console.log('[DB] Connected to MongoDB');
+
+  await db.collection('users').createIndex({ username: 1 }, { unique: true });
+  await db.collection('users').createIndex({ permId: 1 }, { unique: true });
+  await db.collection('posts').createIndex({ createdAt: -1 });
+  await db.collection('posts').createIndex({ likes: -1 });
 }
 
+// ─── MESSAGE HANDLER ──────────────────────────────────────────────────────────
 async function handleMessage(ws, message) {
   let parsed;
   try {
@@ -26,7 +47,9 @@ async function handleMessage(ws, message) {
   const { type, payload, reqId } = parsed;
 
   const reply = (data) => {
-    ws.send(JSON.stringify({ ...data, reqId }));
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ ...data, reqId }));
+    }
   };
 
   const broadcast = (data, excludeWs) => {
@@ -84,26 +107,18 @@ async function handleMessage(ws, message) {
         let sortQuery = { createdAt: -1 };
         if (sort === 'popular') sortQuery = { likes: -1 };
         if (sort === 'oldest') sortQuery = { createdAt: 1 };
-
-        const posts = await db.collection('posts')
-          .find({})
-          .sort(sortQuery)
-          .toArray();
-
+        const posts = await db.collection('posts').find({}).sort(sortQuery).toArray();
         reply({ type: 'posts_list', posts });
         break;
       }
 
       case 'create_post': {
         const { title, content, authorUsername, authorPermId } = payload;
-
-        // verify author
         const user = await db.collection('users').findOne({ permId: authorPermId });
         if (!user || user.username !== authorUsername.toLowerCase()) {
           reply({ type: 'create_post_result', success: false, reason: 'AUTH_FAILED' });
           return;
         }
-
         const post = {
           title,
           content,
@@ -113,10 +128,8 @@ async function handleMessage(ws, message) {
           comments: [],
           createdAt: new Date()
         };
-
         const result = await db.collection('posts').insertOne(post);
         post._id = result.insertedId;
-
         reply({ type: 'create_post_result', success: true, post });
         broadcast({ type: 'new_post', post }, ws);
         break;
@@ -124,45 +137,38 @@ async function handleMessage(ws, message) {
 
       case 'get_post': {
         const { postId } = payload;
-        const post = await db.collection('posts').findOne({ _id: new ObjectId(postId) });
-        if (!post) {
-          reply({ type: 'post_detail', post: null });
-          return;
-        }
+        let post = null;
+        try {
+          post = await db.collection('posts').findOne({ _id: new ObjectId(postId) });
+        } catch { /* invalid id */ }
         reply({ type: 'post_detail', post });
         break;
       }
 
       case 'like_post': {
         const { postId, permId, username } = payload;
-
-        // verify
         const user = await db.collection('users').findOne({ permId });
         if (!user || user.username !== username.toLowerCase()) {
           reply({ type: 'like_result', success: false, reason: 'AUTH_FAILED' });
           return;
         }
-
-        const post = await db.collection('posts').findOne({ _id: new ObjectId(postId) });
+        let post = null;
+        try {
+          post = await db.collection('posts').findOne({ _id: new ObjectId(postId) });
+        } catch {
+          reply({ type: 'like_result', success: false, reason: 'INVALID_ID' });
+          return;
+        }
         if (!post) {
           reply({ type: 'like_result', success: false, reason: 'POST_NOT_FOUND' });
           return;
         }
-
-        const alreadyLiked = post.likedBy.includes(permId);
-        let update;
-        let newLikes;
-
-        if (alreadyLiked) {
-          newLikes = post.likes - 1;
-          update = { $inc: { likes: -1 }, $pull: { likedBy: permId } };
-        } else {
-          newLikes = post.likes + 1;
-          update = { $inc: { likes: 1 }, $push: { likedBy: permId } };
-        }
-
+        const alreadyLiked = (post.likedBy || []).includes(permId);
+        const update = alreadyLiked
+          ? { $inc: { likes: -1 }, $pull: { likedBy: permId } }
+          : { $inc: { likes: 1 }, $push: { likedBy: permId } };
         await db.collection('posts').updateOne({ _id: new ObjectId(postId) }, update);
-
+        const newLikes = alreadyLiked ? post.likes - 1 : post.likes + 1;
         reply({ type: 'like_result', success: true, postId, likes: newLikes, liked: !alreadyLiked });
         broadcast({ type: 'post_likes_updated', postId, likes: newLikes }, ws);
         break;
@@ -170,25 +176,26 @@ async function handleMessage(ws, message) {
 
       case 'add_comment': {
         const { postId, content, authorUsername, authorPermId } = payload;
-
         const user = await db.collection('users').findOne({ permId: authorPermId });
         if (!user || user.username !== authorUsername.toLowerCase()) {
           reply({ type: 'add_comment_result', success: false, reason: 'AUTH_FAILED' });
           return;
         }
-
         const comment = {
           id: new ObjectId().toString(),
           content,
           author: user.displayUsername,
           createdAt: new Date()
         };
-
-        await db.collection('posts').updateOne(
-          { _id: new ObjectId(postId) },
-          { $push: { comments: comment } }
-        );
-
+        try {
+          await db.collection('posts').updateOne(
+            { _id: new ObjectId(postId) },
+            { $push: { comments: comment } }
+          );
+        } catch {
+          reply({ type: 'add_comment_result', success: false, reason: 'INVALID_ID' });
+          return;
+        }
         reply({ type: 'add_comment_result', success: true, comment });
         broadcast({ type: 'new_comment', postId, comment }, ws);
         break;
@@ -198,33 +205,32 @@ async function handleMessage(ws, message) {
         reply({ type: 'error', message: `Unknown type: ${type}` });
     }
   } catch (err) {
-    console.error('Handler error:', err);
+    console.error('[Handler Error]', type, err);
     reply({ type: 'error', message: 'Server error: ' + err.message });
   }
 }
 
+// ─── WS EVENTS ────────────────────────────────────────────────────────────────
+wss.on('connection', (ws, req) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+  console.log(`[WS] Client connected: ${ip}`);
+
+  ws.on('message', (message) => handleMessage(ws, message.toString()));
+  ws.on('close', () => console.log(`[WS] Client disconnected: ${ip}`));
+  ws.on('error', (err) => console.error('[WS] Socket error:', err.message));
+});
+
+// ─── STARTUP ──────────────────────────────────────────────────────────────────
 async function main() {
+  console.log('[Server] Connecting to MongoDB...');
   await connectDB();
 
-  wss = new WebSocket.Server({ port: PORT });
-
-  wss.on('connection', (ws) => {
-    console.log('Client connected');
-
-    ws.on('message', (message) => {
-      handleMessage(ws, message.toString());
-    });
-
-    ws.on('close', () => {
-      console.log('Client disconnected');
-    });
-
-    ws.on('error', (err) => {
-      console.error('WS error:', err);
-    });
+  httpServer.listen(PORT, () => {
+    console.log(`[Server] HTTP + WebSocket listening on port ${PORT}`);
   });
-
-  console.log(`WebSocket server running on port ${PORT}`);
 }
 
-main().catch(console.error);
+main().catch((err) => {
+  console.error('[FATAL] Startup error:', err);
+  process.exit(1);
+});
