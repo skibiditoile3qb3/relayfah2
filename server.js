@@ -21,6 +21,28 @@ const httpServer = http.createServer((req, res) => {
 // ─── WEBSOCKET SERVER (attached to HTTP server) ───────────────────────────────
 const wss = new WebSocket.Server({ server: httpServer });
 
+// ─── ONLINE USER TRACKING ─────────────────────────────────────────────────────
+const onlineClients = new Map(); // ws -> { username, lastSeen }
+
+function broadcastOnlineCount() {
+  const count = onlineClients.size;
+  const msg = JSON.stringify({ type: 'online_count', count });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  });
+}
+
+// Prune stale clients every 30s (missed 2 heartbeats)
+setInterval(() => {
+  const now = Date.now();
+  for (const [ws, info] of onlineClients.entries()) {
+    if (now - info.lastSeen > 40000) {
+      onlineClients.delete(ws);
+    }
+  }
+  broadcastOnlineCount();
+}, 30000);
+
 // ─── MONGODB ──────────────────────────────────────────────────────────────────
 async function connectDB() {
   const client = new MongoClient(MONGO_URI);
@@ -201,6 +223,13 @@ async function handleMessage(ws, message) {
         break;
       }
 
+      case 'heartbeat': {
+        onlineClients.set(ws, { username: payload.username, lastSeen: Date.now() });
+        broadcastOnlineCount();
+        reply({ type: 'heartbeat_ack', count: onlineClients.size });
+        break;
+      }
+
       default:
         reply({ type: 'error', message: `Unknown type: ${type}` });
     }
@@ -215,9 +244,23 @@ wss.on('connection', (ws, req) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   console.log(`[WS] Client connected: ${ip}`);
 
+  // Register as online immediately
+  onlineClients.set(ws, { username: null, lastSeen: Date.now() });
+  broadcastOnlineCount();
+
   ws.on('message', (message) => handleMessage(ws, message.toString()));
-  ws.on('close', () => console.log(`[WS] Client disconnected: ${ip}`));
-  ws.on('error', (err) => console.error('[WS] Socket error:', err.message));
+
+  ws.on('close', () => {
+    console.log(`[WS] Client disconnected: ${ip}`);
+    onlineClients.delete(ws);
+    broadcastOnlineCount();
+  });
+
+  ws.on('error', (err) => {
+    console.error('[WS] Socket error:', err.message);
+    onlineClients.delete(ws);
+    broadcastOnlineCount();
+  });
 });
 
 // ─── STARTUP ──────────────────────────────────────────────────────────────────
