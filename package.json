@@ -1,0 +1,20 @@
+{
+  "name": "forum-relay-server",
+  "version": "1.0.0",
+  "description": "WebSocket relay server for Forum website",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.3.0",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
