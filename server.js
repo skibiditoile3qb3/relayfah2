@@ -32,6 +32,10 @@ function broadcastOnlineCount() {
   });
 }
 
+// ─── CHAT HISTORY (last 100 messages in memory) ──────────────────────────────
+const chatHistory = [];
+const MAX_CHAT_HISTORY = 100;
+
 // Prune stale clients every 30s (missed 2 heartbeats)
 setInterval(() => {
   const now = Date.now();
@@ -220,6 +224,38 @@ async function handleMessage(ws, message) {
         }
         reply({ type: 'add_comment_result', success: true, comment });
         broadcast({ type: 'new_comment', postId, comment }, ws);
+        break;
+      }
+
+      case 'get_chat_history': {
+        reply({ type: 'chat_history', messages: chatHistory });
+        break;
+      }
+
+      case 'chat_message': {
+        const { text, author } = payload;
+        if (!text || !text.trim() || !author) break;
+
+        // Verify sender is logged in
+        const chatUser = await db.collection('users').findOne({ displayUsername: author });
+        if (!chatUser) break;
+
+        const msg = {
+          author,
+          text: text.trim().slice(0, 300),
+          ts: new Date().toISOString()
+        };
+
+        // Store in memory history
+        chatHistory.push(msg);
+        if (chatHistory.length > MAX_CHAT_HISTORY) chatHistory.shift();
+
+        // Broadcast to ALL clients including sender
+        wss.clients.forEach(client => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(JSON.stringify({ type: 'chat_message', ...msg }));
+          }
+        });
         break;
       }
 
