@@ -464,6 +464,7 @@ async function handleMessage(ws, message) {
           reply({ type: 'groq_result', error: 'No API key configured' });
           break;
         }
+          console.log(`[GROQ] Request for emojis: ${emojis} | Previous guesses: ${previousGuesses?.length || 0}`);
         const prevText = previousGuesses?.length
           ? ` Do NOT guess: ${previousGuesses.map(g => `"${g}"`).join(', ')}.`
           : '';
@@ -487,6 +488,8 @@ async function handleMessage(ws, message) {
           const guess = data.choices?.[0]?.message?.content?.trim().toUpperCase();
           if (!guess) throw new Error('Empty response');
           reply({ type: 'groq_result', guess });
+          console.log(`[GROQ] Response: "${guess}"`);
+
         } catch (err) {
           reply({ type: 'groq_result', error: err.message });
         }
