@@ -457,6 +457,41 @@ async function handleMessage(ws, message) {
         reply({ type: 'game_ready_ack' });
         break;
       }
+        case 'groq_guess': {
+        const { emojis, previousGuesses } = payload;
+        const apiKey = process.env.GROQ_API_KEY;
+        if (!apiKey) {
+          reply({ type: 'groq_result', error: 'No API key configured' });
+          break;
+        }
+        const prevText = previousGuesses?.length
+          ? ` Do NOT guess: ${previousGuesses.map(g => `"${g}"`).join(', ')}.`
+          : '';
+        const prompt = `What single word or short phrase does this emoji combination represent?${prevText} Reply with ONLY the word or phrase, nothing else. Emoji combo: ${emojis}`;
+        try {
+          const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${apiKey}`
+            },
+            body: JSON.stringify({
+              model: 'llama3-70b-8192',
+              messages: [{ role: 'user', content: prompt }],
+              max_tokens: 20,
+              temperature: 0.7
+            })
+          });
+          if (!res.ok) throw new Error('Groq error ' + res.status);
+          const data = await res.json();
+          const guess = data.choices?.[0]?.message?.content?.trim().toUpperCase();
+          if (!guess) throw new Error('Empty response');
+          reply({ type: 'groq_result', guess });
+        } catch (err) {
+          reply({ type: 'groq_result', error: err.message });
+        }
+        break;
+      }
 
       default:
         reply({ type: 'error', message: `Unknown type: ${type}` });
