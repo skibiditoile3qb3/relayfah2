@@ -458,16 +458,28 @@ async function handleMessage(ws, message) {
         break;
       }
         case 'groq_guess': {
-        const { emojis, previousGuesses } = payload;
-        const apiKey = process.env.GROQ_API_KEY;
-        if (!apiKey) {
-          reply({ type: 'groq_result', error: 'No API key configured' });
-          break;
-        }
+  const { emojis, previousGuesses } = payload;
+  const apiKey = process.env.GROQ_API_KEY;
+
+  console.log('[GROQ] emojis:', emojis, '| previousGuesses:', previousGuesses);
+
+  if (!apiKey) {
+    reply({ type: 'groq_result', error: 'No API key configured' });
+    break;
+  }
+  if (!emojis || !emojis.trim()) {
+    reply({ type: 'groq_result', error: 'No emojis provided' });
+    break;
+  }
+
+  // Sanitize: ensure previousGuesses is a clean array of strings
+  const prevGuesses = Array.isArray(previousGuesses)
+    ? previousGuesses.filter(g => typeof g === 'string').slice(0, 20)
+    : [];
           console.log(`[GROQ] Request for emojis: ${emojis} | Previous guesses: ${previousGuesses?.length || 0}`);
-        const prevText = previousGuesses?.length
-          ? ` Do NOT guess: ${previousGuesses.map(g => `"${g}"`).join(', ')}.`
-          : '';
+        const prevText = prevGuesses.length
+    ? ` Do NOT guess: ${prevGuesses.map(g => `"${g}"`).join(', ')}.`
+    : '';
         const prompt = `What single word or short phrase does this emoji combination represent?${prevText} Reply with ONLY the word or phrase, nothing else. Emoji combo: ${emojis}`;
         try {
           const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
