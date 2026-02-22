@@ -264,7 +264,7 @@ async function handleMessage(ws, message) {
       }
 
       case 'groq_ask': {
-        const { question } = payload;
+        const { question, history = [] } = payload;
         const apiKey = process.env.GROQ_API_KEY;
 
         if (!apiKey) {
@@ -276,6 +276,11 @@ async function handleMessage(ws, message) {
           break;
         }
 
+        // Use full history as context — nothing stored server-side
+        const messages = history.length > 0
+          ? history
+          : [{ role: 'user', content: question.trim() }];
+
         try {
           const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
@@ -285,7 +290,7 @@ async function handleMessage(ws, message) {
             },
             body: JSON.stringify({
               model: 'llama-3.1-8b-instant',
-              messages: [{ role: 'user', content: question.trim() }],
+              messages,
               max_tokens: 1024,
               temperature: 0.7
             })
@@ -302,7 +307,7 @@ async function handleMessage(ws, message) {
             model: data.model || 'llama-3.1-8b-instant',
             tokens: data.usage?.total_tokens
           });
-          console.log(`[GROQ_ASK] Q: "${question.slice(0, 60)}..." | tokens: ${data.usage?.total_tokens}`);
+          console.log(`[GROQ_ASK] Q: "${question.slice(0, 60)}..." | exchanges: ${history.length / 2 | 0} | tokens: ${data.usage?.total_tokens}`);
         } catch (err) {
           console.error('[GROQ_ASK] Error:', err.message);
           reply({ type: 'groq_ask_result', error: err.message });
