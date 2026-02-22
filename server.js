@@ -34,7 +34,6 @@ function broadcastOnlineCount() {
 
 // ─── CHAT HISTORY (last 100 messages in memory) ──────────────────────────────
 const chatHistory = [];
-const gameRooms = new Map();
 const MAX_CHAT_HISTORY = 100;
 
 // Prune stale clients every 30s (missed 2 heartbeats)
@@ -59,67 +58,6 @@ async function connectDB() {
   await db.collection('users').createIndex({ permId: 1 }, { unique: true });
   await db.collection('posts').createIndex({ createdAt: -1 });
   await db.collection('posts').createIndex({ likes: -1 });
-}
-
-// ─── GAME HELPERS ─────────────────────────────────────────────────────────────
-function startGameRound(room) {
-  room.currentRound++;
-  if (room.currentRound > room.totalRounds) {
-    room.state = 'finished';
-    room.players.forEach(p => {
-      if (p.ws.readyState === WebSocket.OPEN) {
-        p.ws.send(JSON.stringify({
-          type: 'game_game_over',
-          payload: { finalPlayers: room.players.map(pl => ({ name: pl.name, score: pl.score })) }
-        }));
-      }
-    });
-    gameRooms.delete(room.code);
-    return;
-  }
-
-  room.state = 'making';
-  room.currentMakerIndex = (room.currentRound - 1) % room.players.length;
-  room.currentWord = room.wordList[room.currentRound - 1] || 'MYSTERY';
-  room.currentEmojis = '';
-  room.correctGuessers = new Set();
-
-  const makerName = room.players[room.currentMakerIndex].name;
-
-  room.players.forEach(p => {
-    if (p.ws.readyState !== WebSocket.OPEN) return;
-    p.ws.send(JSON.stringify({
-      type: 'game_round_start',
-      payload: {
-        round: room.currentRound,
-        makerIndex: room.currentMakerIndex,
-        word: p.name === makerName ? room.currentWord : undefined,
-      }
-    }));
-  });
-
-  if (room.roundTimer) clearTimeout(room.roundTimer);
-  room.roundTimer = setTimeout(() => {
-    if (room.state === 'making') endGameRound(room, null);
-  }, 70000);
-}
-
-function endGameRound(room, winnerName) {
-  if (room.roundTimer) { clearTimeout(room.roundTimer); room.roundTimer = null; }
-  room.state = 'reveal';
-
-  const scores = {};
-  room.players.forEach(p => { scores[p.name] = p.score; });
-
-  room.players.forEach(p => {
-    if (p.ws.readyState !== WebSocket.OPEN) return;
-    p.ws.send(JSON.stringify({
-      type: 'game_round_end',
-      payload: { winner: winnerName, word: room.currentWord, scores }
-    }));
-  });
-
-  setTimeout(() => startGameRound(room), 6000);
 }
 
 // ─── MESSAGE HANDLER ──────────────────────────────────────────────────────────
@@ -298,7 +236,6 @@ async function handleMessage(ws, message) {
         const { text, author } = payload;
         if (!text || !text.trim() || !author) break;
 
-        // Verify sender is logged in
         const chatUser = await db.collection('users').findOne({ displayUsername: author });
         if (!chatUser) break;
 
@@ -308,11 +245,9 @@ async function handleMessage(ws, message) {
           ts: new Date().toISOString()
         };
 
-        // Store in memory history
         chatHistory.push(msg);
         if (chatHistory.length > MAX_CHAT_HISTORY) chatHistory.shift();
 
-        // Broadcast to ALL clients including sender
         wss.clients.forEach(client => {
           if (client.readyState === WebSocket.OPEN) {
             client.send(JSON.stringify({ type: 'chat_message', ...msg }));
@@ -328,159 +263,19 @@ async function handleMessage(ws, message) {
         break;
       }
 
-         case 'game_join': {
-        const { roomCode, player: pName } = payload;
-        if (!roomCode || !pName) break;
+      case 'groq_ask': {
+        const { question } = payload;
+        const apiKey = process.env.GROQ_API_KEY;
 
-        let room = gameRooms.get(roomCode);
-        if (!room) {
-          room = {
-            code: roomCode,
-            players: [],
-            state: 'waiting',
-            currentRound: 0,
-            totalRounds: 0,
-            wordList: [],
-            currentMakerIndex: 0,
-            currentWord: '',
-            currentEmojis: '',
-            correctGuessers: new Set(),
-            roundTimer: null,
-          };
-          gameRooms.set(roomCode, room);
+        if (!apiKey) {
+          reply({ type: 'groq_ask_result', error: 'No API key configured' });
+          break;
+        }
+        if (!question || !question.trim()) {
+          reply({ type: 'groq_ask_result', error: 'No question provided' });
+          break;
         }
 
-        if (!room.players.find(p => p.name === pName)) {
-          room.players.push({ ws, name: pName, score: 0 });
-          room.players.forEach(p => {
-            if (p.ws !== ws && p.ws.readyState === WebSocket.OPEN) {
-              p.ws.send(JSON.stringify({
-                type: 'game_player_joined',
-                payload: { player: pName }
-              }));
-            }
-          });
-        }
-        reply({ type: 'game_join_ack', roomCode });
-        break;
-      }
-
-      case 'game_start_game': {
-        const { roomCode, totalRounds: tr, wordList } = payload;
-        const room = gameRooms.get(roomCode);
-        if (!room || room.state !== 'waiting') break;
-
-        room.totalRounds = tr;
-        room.wordList = wordList;
-        room.currentRound = 0;
-        room.state = 'making';
-
-        room.players.forEach(p => {
-          if (p.ws.readyState !== WebSocket.OPEN) return;
-          p.ws.send(JSON.stringify({
-            type: 'game_game_started',
-            payload: {
-              totalRounds: tr,
-              players: room.players.map(pl => ({ name: pl.name, score: 0 }))
-            }
-          }));
-        });
-
-        startGameRound(room);
-        break;
-      }
-
-      case 'game_emoji_locked': {
-        const { roomCode, emojis } = payload;
-        const room = gameRooms.get(roomCode);
-        if (!room || room.state !== 'making') break;
-
-        room.currentEmojis = emojis;
-        room.correctGuessers = new Set();
-        room.state = 'guessing';
-
-        const makerName = room.players[room.currentMakerIndex]?.name;
-
-        room.players.forEach(p => {
-          if (p.ws.readyState !== WebSocket.OPEN) return;
-          p.ws.send(JSON.stringify({
-            type: 'game_emoji_revealed',
-            payload: { emojis, maker: makerName }
-          }));
-        });
-
-        if (room.roundTimer) clearTimeout(room.roundTimer);
-        room.roundTimer = setTimeout(() => endGameRound(room, null), 90000);
-        break;
-      }
-
-      case 'game_player_guess': {
-        const { roomCode, player: guesser, guess } = payload;
-        const room = gameRooms.get(roomCode);
-        if (!room || room.state !== 'guessing') break;
-
-        const makerName = room.players[room.currentMakerIndex]?.name;
-        if (guesser === makerName || room.correctGuessers.has(guesser)) break;
-
-        const normalize = s => s.toUpperCase().replace(/[^A-Z0-9 ]/g, '').trim();
-        const correct = normalize(guess) === normalize(room.currentWord);
-
-        let points = 0;
-        if (correct) {
-          room.correctGuessers.add(guesser);
-          const guessNum = room.correctGuessers.size;
-          points = Math.max(200, 1000 - (guessNum - 1) * 300);
-
-          const guesserPlayer = room.players.find(p => p.name === guesser);
-          if (guesserPlayer) guesserPlayer.score += points;
-
-          const makerPlayer = room.players.find(p => p.name === makerName);
-          if (makerPlayer) makerPlayer.score += 150;
-        }
-
-        room.players.forEach(p => {
-          if (p.ws.readyState !== WebSocket.OPEN) return;
-          p.ws.send(JSON.stringify({
-            type: 'game_guess_result',
-            payload: { player: guesser, guess, correct, points }
-          }));
-        });
-
-        const nonMakers = room.players.filter(p => p.name !== makerName);
-        if (correct && room.correctGuessers.size >= nonMakers.length) {
-          endGameRound(room, guesser);
-        }
-        break;
-      }
-
-      case 'game_ready_next_round': {
-        reply({ type: 'game_ready_ack' });
-        break;
-      }
-        case 'groq_guess': {
-  const { emojis, previousGuesses } = payload;
-  const apiKey = process.env.GROQ_API_KEY;
-
-  console.log('[GROQ] emojis:', emojis, '| previousGuesses:', previousGuesses);
-
-  if (!apiKey) {
-    reply({ type: 'groq_result', error: 'No API key configured' });
-    break;
-  }
-  if (!emojis || !emojis.trim()) {
-    reply({ type: 'groq_result', error: 'No emojis provided' });
-    break;
-  }
-
-  // Sanitize: ensure previousGuesses is a clean array of strings
-  const prevGuesses = Array.isArray(previousGuesses)
-    ? previousGuesses.filter(g => typeof g === 'string').slice(0, 20)
-    : [];
-          console.log(`[GROQ] Request for emojis: ${emojis} | Previous guesses: ${previousGuesses?.length || 0}`);
-        const prevText = prevGuesses.length
-    ? ` Do NOT guess: ${prevGuesses.map(g => `"${g}"`).join(', ')}.`
-    : '';
-        const prompt = `What single word or short phrase does this emoji combination represent?${prevText} Reply with ONLY the word or phrase, nothing else. Emoji combo: ${emojis}`;
         try {
           const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
             method: 'POST',
@@ -490,20 +285,27 @@ async function handleMessage(ws, message) {
             },
             body: JSON.stringify({
               model: 'llama-3.1-8b-instant',
-              messages: [{ role: 'user', content: prompt }],
-              max_tokens: 20,
+              messages: [{ role: 'user', content: question.trim() }],
+              max_tokens: 1024,
               temperature: 0.7
             })
           });
-          if (!res.ok) throw new Error('Groq error ' + res.status);
-          const data = await res.json();
-          const guess = data.choices?.[0]?.message?.content?.trim().toUpperCase();
-          if (!guess) throw new Error('Empty response');
-          reply({ type: 'groq_result', guess });
-          console.log(`[GROQ] Response: "${guess}"`);
 
+          if (!res.ok) throw new Error('Groq API error ' + res.status);
+          const data = await res.json();
+          const answer = data.choices?.[0]?.message?.content?.trim();
+          if (!answer) throw new Error('Empty response from Groq');
+
+          reply({
+            type: 'groq_ask_result',
+            answer,
+            model: data.model || 'llama-3.1-8b-instant',
+            tokens: data.usage?.total_tokens
+          });
+          console.log(`[GROQ_ASK] Q: "${question.slice(0, 60)}..." | tokens: ${data.usage?.total_tokens}`);
         } catch (err) {
-          reply({ type: 'groq_result', error: err.message });
+          console.error('[GROQ_ASK] Error:', err.message);
+          reply({ type: 'groq_ask_result', error: err.message });
         }
         break;
       }
@@ -522,7 +324,6 @@ wss.on('connection', (ws, req) => {
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   console.log(`[WS] Client connected: ${ip}`);
 
-  // Register as online immediately
   onlineClients.set(ws, { username: null, lastSeen: Date.now() });
   broadcastOnlineCount();
 
